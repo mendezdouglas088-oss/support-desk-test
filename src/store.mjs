@@ -3,7 +3,8 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 export class DeskError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  // `extra` is merged into the JSON error body, for example { sendState: 'UNKNOWN' }.
+  constructor(status, message, extra) { super(message); this.status = status; this.extra = extra; }
 }
 
 export function openStore(path) {

@@ -7,7 +7,7 @@ import { ProviderClient } from './provider-client.mjs';
 import { actors, DeskError } from './store.mjs';
 
 const service = new DeskService({ databasePath: process.env.DESK_DB || resolve('data/desk.sqlite'),
-  provider: new ProviderClient(process.env.PROVIDER_URL) });
+  provider: new ProviderClient(process.env.PROVIDER_URL, { timeoutMs: Number(process.env.PROVIDER_TIMEOUT_MS) || undefined }) });
 const read = async req => {
   let body = '';
   for await (const chunk of req) {
@@ -51,7 +51,7 @@ const server = createServer(async (req, res) => {
       default: throw new DeskError(404, 'Not found');
     }
     json(res, 200, result);
-  } catch (e) { json(res, e.status || 502, { error: e.message }); }
+  } catch (e) { json(res, e.status || 502, { error: e.message, ...e.extra }); }
 });
 server.listen(Number(process.env.PORT || 4300), '127.0.0.1', () => console.log('Support desk: http://127.0.0.1:' + (process.env.PORT || 4300)));
 process.on('SIGTERM', () => server.close(() => { service.close(); process.exit(); }));

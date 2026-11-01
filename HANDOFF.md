@@ -1,6 +1,6 @@
 # Handoff
 
-> **Status: work in progress.** Requirements 1 (isolation), 2 (duplicate webhooks) and 3 (exact-text approval) are complete and verified. Requirements 4-6 are not implemented yet. Updated as each requirement is finished. Spanish version: `HANDOFF_SPANISH.md`.
+> **Status: work in progress.** Requirements 1 (isolation), 2 (duplicate webhooks) and 3 (exact-text approval) are complete and verified. Requirement 4 (honest delivery) is implemented and its tests are written, but the suite has **not been run yet** against it. Requirements 5-6 are not implemented yet. Updated as each requirement is finished. Spanish version: `HANDOFF_SPANISH.md`.
 
 ## Changes and ownership
 
@@ -14,18 +14,25 @@
   - `openStore` refuses a database with the old schema. **If `data/` exists from an earlier run, stop the app and delete `data/`.**
 - **Requirement 3 - Approval of the exact text** (`src/service.mjs`, `src/server.mjs`).
   - `updateDraft` bumps the version **and clears `approved_version`**, so edited text must be approved again. It no longer touches `send_state`, so an edit cannot hide a `SENT` or `UNKNOWN` delivery.
-  - `sendReply` decides what to send in one transaction: `send_state` must be `DRAFT` (otherwise **409**, so a sent reply cannot be sent again), the approval must match the current version (otherwise 409), and it captures that body and version. The provider receives exactly that body; an edit made while the provider call is in flight cannot change it.
+  - `sendReply` decides what to send in one transaction: `send_state` must be `DRAFT` or `FAILED` (otherwise **409**, so a sent, in-progress or unconfirmed reply cannot be sent again), the approval must match the current version (otherwise 409), and it captures that body and version. The provider receives exactly that body; an edit made while the provider call is in flight cannot change it.
   - `approveDraft` accepts an optional `version`: if the draft moved on, it answers 409; a non-integer gives 400. Omitting it approves the current version. The audit records the version in `approved` and `sent` entries (for example `agent-alpha: v2`).
-  - Decisions: editing stays allowed after `SENT`/`UNKNOWN` (state preserved); a ticket holds one sent reply, and a follow-up flow is not designed. The pinned body/version live in memory inside `sendReply`. Writing them to `attempts` is left to requirement 4, because an attempt row needs `UNKNOWN`/`FAILED` or a failed send would leave the ticket stuck on `UNIQUE(ticket_id, version)`.
-- **Tests added:** `isolation.test.mjs`, `isolation-http.test.mjs` (port 4390), `webhook.test.mjs`, `webhook-http.test.mjs` (4391), `approval.test.mjs`, `approval-http.test.mjs` (4392) and `helpers.mjs` (starts the real server with a temporary SQLite database; one port per HTTP file because `node --test` runs files in parallel).
+  - Decisions: editing stays allowed after `SENT`/`UNKNOWN` (state preserved); a ticket holds one sent reply, and a follow-up flow is not designed. The pinned body/version are now stored in `attempts` as part of requirement 4, which adds the `UNKNOWN`/`FAILED` states an attempt row needs (without them a failed send would leave the ticket stuck on `UNIQUE(ticket_id, version)`).
+- **Requirement 4 - Honest delivery and recovery** (`src/service.mjs`, `src/server.mjs`, `src/provider-client.mjs`).
+  - `sendReply` reserves the attempt **before** calling the provider. In one transaction it checks state and approval, reads the approved text and stores a `PENDING` row in `attempts` (body, version and a new `client_ref`), sets the ticket to `PENDING` and audits `send_started`. A double click or an overlapping request finds `PENDING` and gets **409**.
+  - The provider is called **once**, with no automatic retry. `ProviderClient` has a timeout (default 3 s, `PROVIDER_TIMEOUT_MS`) and classifies failures: HTTP 503 is `not_accepted`; 504, any other non-2xx status, a timeout, a lost connection or an unreadable answer is `unknown`. A 200 without a `providerMessageId` also counts as uncertain.
+  - Outcomes: success is `SENT`, with the provider ID stored in `attempts` (audit `sent`). An explicit 503 is `FAILED` (**502**, audit `send_failed`), a safe failure after which the operator may send again, reusing the same attempt row with a new reference. Anything else is `UNKNOWN` (**504**, audit `send_unknown`): the reference is kept and every new send, manual or automatic, is blocked, even after editing and re-approving. Error bodies include `sendState`.
+  - Restart: when the service starts, any `PENDING` attempt becomes `UNKNOWN` (audit `send_unknown`). On Windows, killing the process runs no `SIGTERM` handler, so the safety comes from the state already stored in SQLite.
+  - `reconcile` (it returned 501 before) works only on a ticket in `UNKNOWN` (otherwise **409**) and never sends. It looks up the stored reference at the provider: `delivered` resolves the same attempt to `SENT` with its ID (audit `reconciled`, plus `duplicate_delivery` if `count` is greater than 1); `not_found` is inconclusive, so the ticket stays `UNKNOWN` and `reconcile_inconclusive` is audited; a failed lookup answers **502**, stays `UNKNOWN` and audits `reconcile_failed`. Two simultaneous checks resolve the attempt once.
+- **Tests added:** `isolation.test.mjs`, `isolation-http.test.mjs` (port 4390), `webhook.test.mjs`, `webhook-http.test.mjs` (4391), `approval.test.mjs`, `approval-http.test.mjs` (4392), `delivery.test.mjs`, `delivery-http.test.mjs` (4393-4395) and `helpers.mjs` (starts the real server with a temporary SQLite database; one port per HTTP file because `node --test` runs files in parallel).
 
-**Proposed, not started:** requirement 4 (honest delivery, `UNKNOWN`, `reconcile`), 5 (human takeover), 6 (usable handoff UI).
+**Proposed, not started:** requirement 5 (human takeover), 6 (usable handoff UI).
 
 ## Verification
 
 Command: `npm test` (Node v24.22.2). Original code `aa0662a`; requirement 1 `d5f7b3a`; requirement 2 `5200b04`; requirement 3 is the uncommitted diff against `5200b04`.
 
-- **After the fixes:** **33 of 33 tests pass, 0 fail** (8 + 13 + 12), run in the project folder.
+- **After the fixes (requirements 1-3):** **33 of 33 tests pass, 0 fail** (8 + 13 + 12), run in the project folder.
+- **Requirement 4: not run yet.** `delivery.test.mjs` (unit tests with a stub provider) and `delivery-http.test.mjs` (real app plus the unmodified mock provider, using its `/deliveries` ledger to check what the customer received) are written, but `npm test` has not been run with them. There is no pass/fail count and no before/after result to report. Run `npm test` and update this section.
 - **Requirement 1, before the fix:** 4 of 8 failed; Alpha got **HTTP 200** reading Beta's ticket 202.
 - **Requirement 2, before the fix** (tests against the original `service.mjs`, `store.mjs`, `server.mjs` in a temporary copy): **11 of 13 failed**, for example `25 simultaneous copies of one event are stored exactly once` and `message and audit entry are written atomically`.
 - **Requirement 3, before the fix** (new tests against the code from `5200b04`): **9 of 12 failed, 3 passed**. The 3 that passed are regression guards. Failing tests include:
@@ -34,25 +41,26 @@ Command: `npm test` (Node v24.22.2). Original code `aa0662a`; requirement 1 `d5f
   - `editing after SENT keeps the SENT state and still cannot trigger a second send`
   - `editing never erases an uncertain delivery state, and that state blocks sending`
   - `approving can name the version, and a stale version is refused`
-- **Verified only manually:** nothing yet. Still to check in the browser: Alpha and Beta see only their own ticket; a replayed event (`npm run event`) shows one message; edit-after-approve shows an error on Send.
-- **Not covered:** requirements 4-6. The `UNKNOWN` state is simulated in a test by writing it to the database, because the code does not produce it yet. A true double click is not fixed: two simultaneous sends can both read `DRAFT` before either marks `SENT` (requirement 4).
+- **Verified only manually:** nothing yet. Still to check in the browser: Alpha and Beta see only their own ticket; a replayed event (`npm run event`) shows one message; edit-after-approve shows an error on Send; with the provider in `accept_then_timeout`, Send leaves the ticket `UNKNOWN` and `reconcile` resolves it without a second delivery in `/deliveries`.
+- **Not covered:** requirements 5-6, and the requirement 4 results (tests written, not run). The UI does not yet show `PENDING`/`UNKNOWN`/`FAILED` clearly or offer a reconcile button (requirement 6).
 
 ## Operator instructions
 
-Pending (depends on requirement 4). For requirements 1-3 only:
+Requirements 1-4. The screen to follow these steps is requirement 6 and is not done; until then, the actions are HTTP calls (`POST /api/tickets/:id/send`, `POST /api/tickets/:id/reconcile`).
 
 - An agent sees only their organization's tickets. Another organization's ticket shows "Ticket not found" by design.
 - A repeated webhook event answers `duplicate: true` and changes nothing; this is expected.
 - After editing a draft, **approve it again**. Send is refused (409) until the current version is approved. A ticket already `SENT`, or with an unconfirmed send, refuses new sends.
 - If the app refuses to start with an "older schema" message, delete `data/` (demo data only).
+- Send states: `PENDING` (a send is in progress; wait), `SENT` (delivered, nothing to do), `FAILED` (the provider explicitly refused it, nothing reached the customer, and you may press Send again), `UNKNOWN` (the provider may have delivered it).
+- **Uncertain delivery (`UNKNOWN`):** do not resend, and do not edit and resend. Call **reconcile**. If the provider confirms delivery, the ticket becomes `SENT` with the provider ID. If the audit shows `duplicate_delivery`, the customer received more than one copy and someone must follow up. `not_found` or a failed lookup do not prove the message was not delivered: the ticket stays `UNKNOWN`, so check again later. There is deliberately no override to resend. A send that was in flight when the app restarted also appears as `UNKNOWN`.
 
 ## Remaining risks and production plan
 
 **Remaining defects (not yet fixed):**
 
-- `sendReply` retries with a new `clientRef`, which can send the customer two messages, and has no timeout.
-- Nothing is stored in `attempts` before calling the provider; there is no `UNKNOWN` or `FAILED` state and `reconcile` returns 501.
-- Two simultaneous sends can both pass the checks.
+- A ticket in `UNKNOWN` can only leave that state through `reconcile`. If the provider never records the reference, it stays blocked until someone handles it outside the app (no manual override or escalation flow).
+- Restart recovery assumes one process: at startup every `PENDING` attempt becomes `UNKNOWN`, which would be wrong if several processes shared the database.
 - Human takeover is not enforced on automatic sends, and `handoff` does not record who took the ticket.
 - The UI shows raw JSON, only inbound messages, always-active buttons and no auto-refresh.
 
@@ -76,5 +84,5 @@ This exercise is not production-ready.
 ## AI use and time
 
 - **Tool:** Claude (Anthropic) in claude.ai with the Desktop Commander and Filesystem extensions, used to review the project, plan, draft tests, propose fixes and run the suite.
-- **Accepted suggestions:** (1) scope `row()` to the actor's organization; (2) `UNIQUE(tenant_id, event_id)` plus `ON CONFLICT DO NOTHING` in one transaction; (3) clear the approval on every edit, check state and approval and capture body and version in one transaction, and leave `send_state` alone on edit. Each is verified by tests that fail on the previous code and pass after.
-- **Time:** about 10 minutes for requirement 1 (estimate). Requirements 2 and 3 not recorded yet. Total to be updated at the end.
+- **Accepted suggestions:** (1) scope `row()` to the actor's organization; (2) `UNIQUE(tenant_id, event_id)` plus `ON CONFLICT DO NOTHING` in one transaction; (3) clear the approval on every edit, check state and approval and capture body and version in one transaction, and leave `send_state` alone on edit; (4) reserve a `PENDING` attempt in the same transaction as the checks and before calling the provider, make a single provider call, mark `UNKNOWN` on any unconfirmed result and on restart, and reconcile from the stored reference. Items 1-3 are verified by tests that fail on the previous code and pass after; the tests for item 4 are written but not run yet.
+- **Time:** about 10 minutes for requirement 1 (estimate). Requirements 2, 3 and 4 not recorded yet. Total to be updated at the end.

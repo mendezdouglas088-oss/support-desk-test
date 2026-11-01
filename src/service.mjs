@@ -6,8 +6,24 @@ export class DeskService {
   constructor({ databasePath = ':memory:', provider }) {
     this.db = openStore(databasePath);
     this.provider = provider;
+    this.recoverInterruptedSends();
   }
   close() { this.db.close(); }
+  // A send that was PENDING when the process stopped (crash, kill, restart) may or may
+  // not have reached the provider. Killing a process on Windows runs no SIGTERM handler,
+  // so this decision is taken from what SQLite says at startup: the attempt becomes
+  // UNKNOWN, which blocks any new send until the operator reconciles it.
+  recoverInterruptedSends() {
+    this.inTransaction(() => {
+      const pending = this.db.prepare("SELECT id, ticket_id, version, client_ref FROM attempts WHERE state = 'PENDING'").all();
+      for (const a of pending) {
+        this.db.prepare("UPDATE attempts SET state = 'UNKNOWN' WHERE id = ?").run(a.id);
+        this.db.prepare("UPDATE tickets SET send_state = 'UNKNOWN' WHERE id = ? AND send_state = 'PENDING'").run(a.ticket_id);
+        record(this.db, a.ticket_id, 'send_unknown',
+          `The process stopped while v${a.version} was being sent (ref ${a.client_ref}); check delivery before sending again`);
+      }
+    });
+  }
   listTickets(actor) {
     return this.db.prepare('SELECT * FROM tickets WHERE tenant_id = ? ORDER BY id').all(actor.tenantId);
   }
@@ -98,38 +114,109 @@ export class DeskService {
     return this.getTicket(actor, id);
   }
   async sendReply(actor, id, { automatic = false } = {}) {
-    // What gets sent is decided here, in one transaction: the state check, the approval
-    // check and the read of the text happen together. The body and version captured are
+    // Reserve the attempt before touching the provider. State check, approval check, the
+    // read of the approved text and the PENDING record happen in ONE transaction, so a
+    // double click or an overlapping request finds PENDING and is refused, and a crash
+    // right after leaves a stored reference to reconcile. The body and version stored are
     // the approved ones; a later edit cannot change what this call sends.
-    const { body, version } = this.inTransaction(() => {
+    const attempt = this.inTransaction(() => {
       const t = this.row(actor, id);
-      if (t.send_state !== 'DRAFT') {
-        throw new DeskError(409, t.send_state === 'SENT'
-          ? 'A reply was already sent for this ticket'
-          : 'A previous send is not confirmed yet');
+      if (t.send_state === 'SENT') throw new DeskError(409, 'A reply was already sent for this ticket');
+      if (t.send_state === 'PENDING') throw new DeskError(409, 'A send is already in progress for this ticket');
+      if (t.send_state === 'UNKNOWN') {
+        throw new DeskError(409, 'A previous send is not confirmed yet: check its delivery before sending again');
       }
+      // DRAFT, or FAILED (the provider explicitly refused the last attempt).
       if (t.approved_version == null || t.approved_version !== t.version) {
         throw new DeskError(409, 'Approve the reply first');
       }
-      return { body: t.draft, version: t.version };
-    });
-    let result;
-    // Requirement 4 will replace this retry loop; it is untouched by requirement 3.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        result = await this.provider.send({ clientRef: randomUUID(), ticketId: id, body });
-        break;
-      } catch (error) {
-        if (attempt === 1) throw error;
+      const clientRef = randomUUID();
+      const previous = this.db.prepare('SELECT id FROM attempts WHERE ticket_id = ? AND version = ?').get(id, t.version);
+      if (previous) {
+        // Only a FAILED attempt of this same version can get here: it reuses its row.
+        this.db.prepare("UPDATE attempts SET client_ref = ?, body = ?, state = 'PENDING', provider_id = NULL WHERE id = ?")
+          .run(clientRef, t.draft, previous.id);
+      } else {
+        this.db.prepare("INSERT INTO attempts(ticket_id, version, client_ref, body, state) VALUES (?, ?, ?, ?, 'PENDING')")
+          .run(id, t.version, clientRef, t.draft);
       }
+      this.db.prepare("UPDATE tickets SET send_state = 'PENDING' WHERE id = ? AND tenant_id = ?").run(id, actor.tenantId);
+      record(this.db, id, 'send_started', `${automatic ? 'automation' : actor.id}: v${t.version} (ref ${clientRef})`);
+      return { clientRef, body: t.draft, version: t.version };
+    });
+
+    // Exactly one call to the provider. Nothing here retries: a retry needs a stored decision.
+    let result, failure;
+    try {
+      result = await this.provider.send({ clientRef: attempt.clientRef, ticketId: id, body: attempt.body });
+      if (typeof result?.providerMessageId !== 'string' || !result.providerMessageId) {
+        failure = Object.assign(new Error('The provider answered without a message id'), { kind: 'unknown' });
+      }
+    } catch (error) { failure = error; }
+
+    if (!failure) {
+      this.inTransaction(() => {
+        this.db.prepare("UPDATE attempts SET state = 'SENT', provider_id = ? WHERE client_ref = ?")
+          .run(result.providerMessageId, attempt.clientRef);
+        this.db.prepare("UPDATE tickets SET send_state = 'SENT' WHERE id = ? AND tenant_id = ?").run(id, actor.tenantId);
+        record(this.db, id, 'sent',
+          `${automatic ? 'automation' : actor.id}: ${result.providerMessageId} (v${attempt.version})`);
+      });
+      return this.getTicket(actor, id);
     }
-    this.db.prepare("UPDATE tickets SET send_state = 'SENT' WHERE id = ? AND tenant_id = ?")
-      .run(id, actor.tenantId);
-    record(this.db, id, 'sent', `${automatic ? 'automation' : actor.id}: ${result.providerMessageId} (v${version})`);
-    return this.getTicket(actor, id);
+
+    // Only an explicit "not accepted" is a safe failure. Anything else may have been delivered.
+    if (failure.kind === 'not_accepted') {
+      this.inTransaction(() => {
+        this.db.prepare("UPDATE attempts SET state = 'FAILED' WHERE client_ref = ?").run(attempt.clientRef);
+        this.db.prepare("UPDATE tickets SET send_state = 'FAILED' WHERE id = ? AND tenant_id = ?").run(id, actor.tenantId);
+        record(this.db, id, 'send_failed', `${failure.message} (v${attempt.version}, ref ${attempt.clientRef})`);
+      });
+      throw new DeskError(502, `${failure.message}. It was not delivered; you may send it again.`, { sendState: 'FAILED' });
+    }
+    this.inTransaction(() => {
+      this.db.prepare("UPDATE attempts SET state = 'UNKNOWN' WHERE client_ref = ?").run(attempt.clientRef);
+      this.db.prepare("UPDATE tickets SET send_state = 'UNKNOWN' WHERE id = ? AND tenant_id = ?").run(id, actor.tenantId);
+      record(this.db, id, 'send_unknown', `${failure.message} (v${attempt.version}, ref ${attempt.clientRef})`);
+    });
+    throw new DeskError(504, `${failure.message}. Delivery is UNKNOWN: check it before sending again.`, { sendState: 'UNKNOWN' });
   }
+  // Resolves the uncertain attempt using provider evidence. It never sends.
+  //   delivered  -> SENT, provider id stored; count > 1 is audited as a duplicate
+  //   not_found  -> inconclusive: stays UNKNOWN, no retry is authorized
+  //   lookup error -> stays UNKNOWN, reported as 502
   async reconcile(actor, id) {
-    this.row(actor, id);
-    throw new DeskError(501, 'Reconciliation has not been implemented');
+    const attempt = this.inTransaction(() => {
+      const t = this.row(actor, id);
+      if (t.send_state !== 'UNKNOWN') throw new DeskError(409, 'There is no uncertain delivery to check');
+      const a = this.db.prepare("SELECT * FROM attempts WHERE ticket_id = ? AND state = 'UNKNOWN' ORDER BY id DESC LIMIT 1").get(id);
+      if (!a) throw new DeskError(409, 'There is no uncertain delivery to check');
+      return a;
+    });
+    let found;
+    try {
+      found = await this.provider.lookup(attempt.client_ref);
+    } catch {
+      record(this.db, id, 'reconcile_failed', `${actor.id}: the provider lookup failed (v${attempt.version}, ref ${attempt.client_ref})`);
+      throw new DeskError(502, 'Could not check the delivery with the provider. The state stays UNKNOWN.', { sendState: 'UNKNOWN' });
+    }
+    this.inTransaction(() => {
+      // Another overlapping check may have resolved it while we waited for the provider.
+      const current = this.db.prepare('SELECT state FROM attempts WHERE id = ?').get(attempt.id);
+      if (current.state !== 'UNKNOWN') return;
+      if (found?.state === 'delivered' && typeof found.providerMessageId === 'string' && found.providerMessageId) {
+        this.db.prepare("UPDATE attempts SET state = 'SENT', provider_id = ? WHERE id = ?").run(found.providerMessageId, attempt.id);
+        this.db.prepare("UPDATE tickets SET send_state = 'SENT' WHERE id = ? AND tenant_id = ?").run(id, actor.tenantId);
+        record(this.db, id, 'reconciled', `${actor.id}: delivered as ${found.providerMessageId} (v${attempt.version})`);
+        if (found.count > 1) {
+          record(this.db, id, 'duplicate_delivery',
+            `The provider has ${found.count} deliveries for reference ${attempt.client_ref} (v${attempt.version})`);
+        }
+      } else {
+        record(this.db, id, 'reconcile_inconclusive',
+          `${actor.id}: the provider has no record of ref ${attempt.client_ref}; this does not prove it was not delivered`);
+      }
+    });
+    return this.getTicket(actor, id);
   }
 }
