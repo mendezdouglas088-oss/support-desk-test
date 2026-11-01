@@ -26,7 +26,7 @@ export function openStore(path) {
       id INTEGER PRIMARY KEY, tenant_id TEXT NOT NULL, contact TEXT NOT NULL,
       subject TEXT NOT NULL, owner TEXT NOT NULL DEFAULT 'automation',
       draft TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL DEFAULT 0,
-      approved_version INTEGER, send_state TEXT NOT NULL DEFAULT 'DRAFT'
+      approved_version INTEGER, send_state TEXT NOT NULL DEFAULT 'DRAFT', human_id TEXT
     );
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY, tenant_id TEXT NOT NULL, ticket_id INTEGER NOT NULL,
@@ -48,6 +48,11 @@ export function openStore(path) {
       (101, 'alpha', 'Jordan Demo', 'Cannot resume my practice exam'),
       (202, 'beta', 'Casey Example', 'Course completion is missing');
   `);
+  // human_id (who took the ticket over) was added after the first schema. Adding a nullable
+  // column is safe, so an existing database is upgraded in place instead of being rejected.
+  if (!db.prepare('PRAGMA table_info(tickets)').all().some((c) => c.name === 'human_id')) {
+    db.exec('ALTER TABLE tickets ADD COLUMN human_id TEXT');
+  }
   return db;
 }
 

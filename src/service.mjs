@@ -106,11 +106,20 @@ export class DeskService {
     });
     return this.getTicket(actor, id);
   }
+  // Takeover: from the moment this commits, automation can no longer send (sendReply
+  // reads `owner` inside its own transaction). We keep WHO took the ticket in human_id.
+  // The same agent repeating it is a no-op; another agent cannot silently overwrite it.
   handoff(actor, id) {
-    this.row(actor, id);
-    this.db.prepare("UPDATE tickets SET owner = 'human' WHERE id = ? AND tenant_id = ?")
-      .run(id, actor.tenantId);
-    record(this.db, id, 'human_handoff', actor.id);
+    this.inTransaction(() => {
+      const t = this.row(actor, id);
+      if (t.owner === 'human') {
+        if (t.human_id === actor.id) return;
+        throw new DeskError(409, `This ticket was already taken by ${t.human_id ?? 'another agent'}`);
+      }
+      this.db.prepare("UPDATE tickets SET owner = 'human', human_id = ? WHERE id = ? AND tenant_id = ?")
+        .run(actor.id, id, actor.tenantId);
+      record(this.db, id, 'human_handoff', actor.id);
+    });
     return this.getTicket(actor, id);
   }
   async sendReply(actor, id, { automatic = false } = {}) {
@@ -121,6 +130,13 @@ export class DeskService {
     // the approved ones; a later edit cannot change what this call sends.
     const attempt = this.inTransaction(() => {
       const t = this.row(actor, id);
+      // Takeover is checked in the same transaction that reserves the attempt, so a takeover
+      // that commits first always wins. Manual sends by a human are not affected.
+      if (automatic && t.owner !== 'automation') {
+        record(this.db, id, 'automation_blocked',
+          `automation tried to send v${t.version} but the ticket is owned by ${t.owner}${t.human_id ? ` (${t.human_id})` : ''}`);
+        return { blocked: true };
+      }
       if (t.send_state === 'SENT') throw new DeskError(409, 'A reply was already sent for this ticket');
       if (t.send_state === 'PENDING') throw new DeskError(409, 'A send is already in progress for this ticket');
       if (t.send_state === 'UNKNOWN') {
@@ -144,6 +160,9 @@ export class DeskService {
       record(this.db, id, 'send_started', `${automatic ? 'automation' : actor.id}: v${t.version} (ref ${clientRef})`);
       return { clientRef, body: t.draft, version: t.version };
     });
+    if (attempt.blocked) {
+      throw new DeskError(409, 'A human has taken over this ticket: automation can no longer send');
+    }
 
     // Exactly one call to the provider. Nothing here retries: a retry needs a stored decision.
     let result, failure;
