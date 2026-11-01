@@ -61,3 +61,27 @@ test('an event naming a ticket of another organization is rejected', async () =>
   assert.equal(r.status, 400);
   assert.equal((await ticket(BETA, 202)).messages.filter((m) => m.event_id === 'cross').length, 0);
 });
+
+// Hard kill (no SIGTERM handler on Windows), then a new process on the same database file:
+// the replay must still be recognised, because the guarantee lives in SQLite, not in memory.
+test('a replay after the app is killed and restarted is still a duplicate', async () => {
+  const first = await startServer(4399);
+  let second;
+  try {
+    const event = evt({ eventId: 'event-restart', body: 'before the crash' });
+    assert.deepEqual((await first.webhook(event)).json, { accepted: true, duplicate: false });
+    await first.crash();
+
+    second = await startServer(4400, { dir: first.dir });
+    const replay = await second.webhook(event);
+    assert.equal(replay.status, 200);
+    assert.deepEqual(replay.json, { accepted: true, duplicate: true });
+
+    const t = (await second.call(ALPHA, 'GET', '/api/tickets/101')).json;
+    assert.equal(t.messages.filter((m) => m.event_id === 'event-restart').length, 1, 'stored once across the restart');
+    assert.equal(inbound(t).filter((a) => a.detail === 'event-restart').length, 1, 'audited once across the restart');
+  } finally {
+    await second?.stop();
+    await first.stop();
+  }
+});

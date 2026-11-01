@@ -47,3 +47,18 @@ test('alpha cannot act on beta ticket 202 over HTTP, and beta data stays untouch
   assert.equal(own.json.owner, 'automation');
   assert.deepEqual(own.json.audit, []);
 });
+
+test('state-changing requests without a valid identity are rejected with 401 and change nothing', async () => {
+  const actions = ['draft', 'approve', 'send', 'automation', 'handoff', 'reconcile'];
+  for (const token of [null, 'not-a-token', 'demo-gamma-token']) {
+    for (const action of actions) {
+      const r = await call(token, 'POST', `/api/tickets/101/${action}`, action === 'draft' ? { body: 'anonymous edit' } : {});
+      assert.equal(r.status, 401, `POST ${action} with token ${token} gave ${r.status}`);
+    }
+  }
+  const own = await call(ALPHA, 'GET', '/api/tickets/101');
+  assert.equal(own.json.draft, '');
+  assert.equal(own.json.version, 0);
+  assert.equal(own.json.owner, 'automation');
+  assert.deepEqual(own.json.audit, []);
+});

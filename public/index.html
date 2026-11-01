@@ -1,24 +1,147 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Support desk work sample</title>
 <style>
-body{font:16px system-ui;margin:32px auto;max-width:1000px;padding:0 20px;color:#182231;background:#f6f7f9}h1{font-size:25px}main{display:grid;grid-template-columns:260px 1fr;gap:30px}button,select,textarea{font:inherit;padding:9px;margin:4px 0}button{cursor:pointer}textarea{width:95%;min-height:100px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;padding:14px;border:1px solid #d5dae2;font-size:13px}#notice{min-height:25px;font-weight:600}li{margin:10px 0}.buttons{display:flex;flex-wrap:wrap;gap:6px}small{color:#586577}@media(max-width:650px){main{display:block}}
+body{font:16px system-ui;margin:32px auto;max-width:1100px;padding:0 20px;color:#182231;background:#f6f7f9}h1{font-size:25px}h3{margin:18px 0 6px}
+main{display:grid;grid-template-columns:260px 1fr;gap:30px}button,select,textarea{font:inherit;padding:9px;margin:4px 0}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.45}
+textarea{width:95%;min-height:100px}#notice{min-height:25px;font-weight:600}li{margin:10px 0}.buttons{display:flex;flex-wrap:wrap;gap:6px}small{color:#586577}
+#tickets{list-style:none;padding:0}#tickets button{width:100%;text-align:left}#tickets button.sel{outline:2px solid #2b5fd9}.tag{display:inline-block;font-size:12px;padding:1px 7px;border-radius:9px;background:#e4e8ee;margin-left:4px}
+.banner{padding:12px 14px;border-left:6px solid #7a8699;background:#fff;margin:10px 0}.banner b{display:block}.banner.ok{border-color:#1f8a4c}.banner.warn{border-color:#d08a00;background:#fff8e6}.banner.bad{border-color:#c0262d;background:#fdeceb}
+.conv{background:#fff;border:1px solid #d5dae2;padding:10px;max-height:320px;overflow:auto}.msg{margin:8px 0;padding:8px 10px;border-radius:6px;max-width:80%;white-space:pre-wrap;overflow-wrap:anywhere}.msg.in{background:#eef1f6}.msg.out{background:#e3f1e8;margin-left:auto}.msg.out.bad{background:#fdeceb}.msg.out.warn{background:#fff8e6}
+.msg small{display:block;margin-bottom:3px}table{border-collapse:collapse;background:#fff;font-size:13px;width:100%}th,td{border:1px solid #d5dae2;padding:5px 8px;text-align:left;overflow-wrap:anywhere}
+.log{list-style:none;padding:0;margin:0;background:#fff;border:1px solid #d5dae2;font-size:13px}.log li{margin:0;padding:6px 10px;border-bottom:1px solid #eef1f6;overflow-wrap:anywhere}.log li.bad{background:#fdeceb}.log li.warn{background:#fff8e6}.log small{margin-right:6px}
+@media(max-width:650px){main{display:block}}
 </style>
 <h1>Support desk work sample</h1><p>Fictional customers · local exercise · no real messages are sent.</p>
 <label>Signed in as <select id="identity"><option value="alpha">Alpha support agent</option><option value="beta">Beta support agent</option></select></label>
-<p id="notice" role="status"></p><main><section><h2>Inbox</h2><button id="refresh">Refresh</button><ul id="tickets"></ul></section>
+<p id="notice" role="status"></p><main><section><h2>Inbox</h2><button id="refresh">Refresh</button><small> updates by itself every few seconds</small><ul id="tickets"></ul></section>
 <section><h2 id="title">Select a ticket</h2><p id="state"></p><div id="work" hidden>
-<h3>Conversation</h3><pre id="messages"></pre><label for="draft">Reply draft</label><textarea id="draft"></textarea>
-<small>The suggested reply is a fixed fixture. No AI API or account is needed.</small>
+<div id="banner" class="banner" role="status"></div>
+<h3>Conversation</h3><div id="messages" class="conv"></div><h3><label for="draft">Reply draft</label></h3><textarea id="draft"></textarea>
+<small>The suggested reply is a fixed fixture. No AI API or account is needed. Buttons that are not safe right now are disabled; the server still decides.</small>
 <div class="buttons"><button data-action="suggest">Use suggested reply</button><button data-action="draft">Save draft</button><button data-action="approve">Approve saved draft</button><button data-action="send">Send manually</button><button data-action="handoff">Take over</button><button data-action="automation">Simulate automation</button><button data-action="reconcile">Check delivery</button></div>
-<h3>Delivery and audit trail</h3><pre id="audit"></pre></div></section></main>
+<h3>Delivery attempts</h3><div id="attempts"></div>
+<h3>Audit trail</h3><ul id="audit" class="log"></ul></div></section></main>
 <script type="module">
-let selected;
-const $=id=>document.getElementById(id);
-async function api(path,method='GET',body){const r=await fetch(path,{method,headers:{'Content-Type':'application/json',Authorization:'Bearer demo-'+$('identity').value+'-token'},body:body===undefined?undefined:JSON.stringify(body)});const data=await r.json();if(!r.ok)throw Error(data.error);return data;}
-function render(t){$('work').hidden=false;$('title').textContent=t.subject+' · '+t.contact;$('state').textContent='Owner: '+t.owner+' | Delivery: '+t.send_state+' | Draft v'+t.version+' | Approved v'+(t.approved_version??'none');$('draft').value=t.draft;$('messages').textContent=t.messages.map(m=>m.body).join('\n\n')||'No inbound messages yet. Run npm run event.';$('audit').textContent=JSON.stringify({attempts:t.attempts,audit:t.audit},null,2);}
-async function refresh(){const rows=await api('/api/tickets');$('tickets').replaceChildren();for(const t of rows){const li=document.createElement('li'),b=document.createElement('button');b.textContent=t.id+': '+t.contact;b.onclick=()=>act(async()=>{selected=t.id;render(await api('/api/tickets/'+selected));});li.append(b);$('tickets').append(li);}}
-async function act(fn){try{$('notice').textContent='';await fn();}catch(e){$('notice').textContent=e.message;if(selected){try{render(await api('/api/tickets/'+selected));}catch{}}}}
-$('refresh').onclick=()=>act(refresh);$('identity').onchange=()=>{selected=undefined;$('work').hidden=true;$('title').textContent='Select a ticket';$('state').textContent='';act(refresh);};
-for(const b of document.querySelectorAll('[data-action]'))b.onclick=()=>act(async()=>{const a=b.dataset.action;if(a==='suggest'){$('draft').value='Thanks for reaching out. A support agent will help you recover your progress.';return;}const t=await api('/api/tickets/'+selected+'/'+a,'POST',a==='draft'?{body:$('draft').value}:{});render(t);$('notice').textContent='Action completed. Check the delivery state and audit trail.';});
+let selected, current, busy = false, seenMessages = 0;
+const $ = id => document.getElementById(id);
+// Every piece of text from the server (customer messages included) goes through textContent
+// or append(string), which create text nodes: nothing here is ever parsed as HTML.
+const el = (tag, cls, ...kids) => { const e = document.createElement(tag); if (cls) e.className = cls; e.append(...kids); return e; };
+const when = s => s ? new Date(String(s).replace(' ', 'T') + 'Z').toLocaleString() : '';
+const stamp = s => s ? new Date(String(s).replace(' ', 'T') + 'Z').getTime() : 0;
+async function api(path, method = 'GET', body) {
+  const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer demo-' + $('identity').value + '-token' }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const data = await r.json();
+  if (!r.ok) throw Error(data.error);
+  return data;
+}
+const dirty = () => !!current && $('draft').value !== current.draft;
+// Which buttons make sense for this ticket. This only guides the agent: the server re-checks everything.
+function can(t) {
+  const open = t.send_state === 'DRAFT' || t.send_state === 'FAILED';
+  const text = $('draft').value.trim() !== '';
+  const saved = !dirty() && t.draft.trim() !== '';
+  const approved = saved && t.approved_version === t.version;
+  return { edit: open, suggest: open, draft: open && dirty() && text, approve: open && saved && !approved, send: open && approved,
+    automation: open && approved && t.owner === 'automation', handoff: t.owner !== 'human', reconcile: t.send_state === 'UNKNOWN' };
+}
+function banner(t) {
+  const s = t.send_state;
+  if (s === 'UNKNOWN') return ['bad', 'Delivery unknown: the customer may or may not have received the reply.', 'Do NOT send again, and do not edit and resend. Press "Check delivery". If the check is inconclusive, try again later.'];
+  if (s === 'PENDING') return ['warn', 'A send is in progress.', 'Wait a few seconds; this screen refreshes by itself. Do not press Send again.'];
+  if (s === 'SENT') return ['ok', 'Reply delivered.', 'Nothing more to do: the reply was delivered once.'];
+  const head = s === 'FAILED' ? 'The provider refused the message, so the customer did NOT receive it. It is safe to send again.' : 'No reply has been sent yet.';
+  let next;
+  if (!t.draft.trim() && !dirty()) next = 'Write a reply or use the suggested one, then save it.';
+  else if (dirty()) next = 'Save the draft. Then it can be approved.';
+  else if (t.approved_version !== t.version) next = 'Review the saved text and approve it. Editing it later removes the approval.';
+  else next = t.owner === 'human' ? 'Approved. Press "Send manually".' : 'Approved. Press "Send manually", or take over first if you want to stop automation.';
+  if (t.owner === 'human' && s !== 'FAILED') next += ' Automation can no longer send this ticket.';
+  return [s === 'FAILED' ? 'warn' : 'info', head, next];
+}
+function paint() {
+  if (!current) return;
+  const [cls, head, next] = banner(current);
+  $('banner').className = 'banner ' + cls;
+  $('banner').replaceChildren(el('b', '', head), next);
+  const c = can(current);
+  for (const b of document.querySelectorAll('[data-action]')) b.disabled = busy || !c[b.dataset.action];
+  $('draft').disabled = busy || !c.edit;
+}
+const ATTEMPT = { SENT: ['Delivered', ''], UNKNOWN: ['Delivery unknown', 'bad'], PENDING: ['Sending...', 'warn'], FAILED: ['Not delivered (provider refused it)', 'warn'] };
+const STARTED = (t, a) => t.audit.find(x => x.action === 'send_started' && x.detail.includes(a.client_ref));
+function conversation(t) {
+  const items = t.messages.map(m => ({ at: stamp(m.created_at), who: 'Customer', date: m.created_at, body: m.body, cls: 'in' }));
+  for (const a of t.attempts) {
+    const [label, cls] = ATTEMPT[a.state] || [a.state, 'warn'];
+    const s = STARTED(t, a);
+    items.push({ at: stamp(s?.created_at), who: 'Support reply v' + a.version + ' - ' + label, date: s?.created_at, body: a.body, cls: 'out ' + cls });
+  }
+  items.sort((x, y) => x.at - y.at);
+  const box = $('messages');
+  if (!items.length) return box.replaceChildren(el('small', '', 'No messages yet. Run npm run event to receive one.'));
+  box.replaceChildren(...items.map(i => el('div', 'msg ' + i.cls, el('small', '', i.who + (i.date ? ' · ' + when(i.date) : '')), i.body)));
+  box.scrollTop = box.scrollHeight;
+}
+function attemptsTable(t) {
+  if (!t.attempts.length) return $('attempts').replaceChildren(el('small', '', 'No send has been attempted.'));
+  const rows = t.attempts.map(a => el('tr', '', el('td', '', 'v' + a.version), el('td', '', (ATTEMPT[a.state] || [a.state])[0]), el('td', '', a.provider_id || '-'), el('td', '', a.client_ref)));
+  $('attempts').replaceChildren(el('table', '', el('tr', '', ...['Version', 'Result', 'Provider message ID', 'Reference'].map(h => el('th', '', h))), ...rows));
+}
+const LABEL = { inbound: 'Customer message received', draft_updated: 'Draft saved', approved: 'Draft approved', human_handoff: 'A human took over', send_started: 'Send started',
+  sent: 'Reply sent', send_failed: 'Provider refused the send (nothing delivered)', send_unknown: 'Delivery unknown', reconciled: 'Delivery confirmed by the provider',
+  reconcile_inconclusive: 'Delivery check inconclusive: still unknown', reconcile_failed: 'Delivery check failed: still unknown', duplicate_delivery: 'DUPLICATE delivery: the customer got more than one copy',
+  automation_blocked: 'Automation was blocked: a human owns this ticket' };
+const BAD = new Set(['send_unknown', 'reconcile_inconclusive', 'reconcile_failed', 'duplicate_delivery']), WARN = new Set(['send_failed', 'automation_blocked']);
+function auditList(t) {
+  $('audit').replaceChildren(...t.audit.map(a => el('li', BAD.has(a.action) ? 'bad' : WARN.has(a.action) ? 'warn' : '',
+    el('small', '', when(a.created_at)), el('b', '', LABEL[a.action] || a.action), ' ' + a.detail)));
+}
+function render(t, keepDraft) {
+  const hadEdits = keepDraft && dirty();
+  current = t;
+  $('work').hidden = false;
+  $('title').textContent = t.subject + ' · ' + t.contact;
+  $('state').textContent = 'Owner: ' + (t.owner === 'human' ? 'human (' + (t.human_id || 'unknown') + ')' : 'automation') + ' | Delivery: ' + t.send_state + ' | Draft v' + t.version + ' | Approved v' + (t.approved_version ?? 'none');
+  if (!hadEdits) $('draft').value = t.draft;
+  conversation(t); attemptsTable(t); auditList(t); paint();
+}
+async function refresh() {
+  const rows = await api('/api/tickets');
+  $('tickets').replaceChildren(...rows.map(t => {
+    const b = el('button', t.id === selected ? 'sel' : '', t.id + ': ' + t.contact, el('span', 'tag', t.owner === 'human' ? 'human' : 'automation'), el('span', 'tag', t.send_state));
+    b.onclick = () => act(async () => { selected = t.id; const full = await api('/api/tickets/' + t.id); seenMessages = full.messages.length; render(full, false); await refresh(); });
+    return el('li', '', b);
+  }));
+}
+async function act(fn, quiet) {
+  if (busy) return;
+  busy = true; paint();
+  try { if (!quiet) $('notice').textContent = ''; await fn(); }
+  catch (e) {
+    if (!quiet) { $('notice').textContent = e.message; if (selected) { try { render(await api('/api/tickets/' + selected), true); } catch { /* keep the screen as it is */ } } }
+  } finally { busy = false; paint(); }
+}
+// A webhook can arrive at any time: the list and the open ticket refresh by themselves,
+// without overwriting a draft the agent is typing.
+async function poll() {
+  await refresh();
+  if (!selected) return;
+  const t = await api('/api/tickets/' + selected);
+  if (t.messages.length > seenMessages) $('notice').textContent = 'New customer message received.';
+  seenMessages = t.messages.length;
+  render(t, true);
+}
+$('refresh').onclick = () => act(poll);
+$('draft').oninput = paint;
+$('identity').onchange = () => { selected = current = undefined; $('work').hidden = true; $('title').textContent = 'Select a ticket'; $('state').textContent = ''; act(refresh); };
+for (const b of document.querySelectorAll('[data-action]')) b.onclick = () => act(async () => {
+  const a = b.dataset.action;
+  if (a === 'suggest') { $('draft').value = 'Thanks for reaching out. A support agent will help you recover your progress.'; return; }
+  const t = await api('/api/tickets/' + selected + '/' + a, 'POST', a === 'draft' ? { body: $('draft').value } : {});
+  render(t, false);
+  $('notice').textContent = a === 'reconcile' && t.send_state === 'UNKNOWN' ? 'The provider has no confirmation yet. The delivery is still unknown.' : 'Action completed. Check the delivery state and audit trail.';
+});
 act(refresh);
+setInterval(() => { if (!document.hidden) act(poll, true); }, 4000);
 </script></html>
