@@ -11,8 +11,13 @@ export class DeskService {
   listTickets(actor) {
     return this.db.prepare('SELECT * FROM tickets WHERE tenant_id = ? ORDER BY id').all(actor.tenantId);
   }
+  // Every ticket access goes through here. The organization comes from the actor
+  // resolved on the server, never from the request. A ticket that belongs to
+  // another organization looks exactly like one that does not exist (404).
   row(actor, id) {
-    const row = this.db.prepare('SELECT * FROM tickets WHERE id = ?').get(id);
+    if (!actor?.tenantId) throw new DeskError(401, 'Sign in using a demo identity');
+    const row = this.db.prepare('SELECT * FROM tickets WHERE id = ? AND tenant_id = ?')
+      .get(id, actor.tenantId);
     if (!row) throw new DeskError(404, 'Ticket not found');
     return row;
   }
@@ -29,21 +34,23 @@ export class DeskService {
   updateDraft(actor, id, body) {
     this.row(actor, id);
     if (typeof body !== 'string' || !body.trim()) throw new DeskError(400, 'A reply is required');
-    this.db.prepare("UPDATE tickets SET draft = ?, version = version + 1, send_state = 'DRAFT' WHERE id = ?")
-      .run(body, id);
+    this.db.prepare("UPDATE tickets SET draft = ?, version = version + 1, send_state = 'DRAFT' WHERE id = ? AND tenant_id = ?")
+      .run(body, id, actor.tenantId);
     record(this.db, id, 'draft_updated', actor.id);
     return this.getTicket(actor, id);
   }
   approveDraft(actor, id) {
     const t = this.row(actor, id);
     if (!t.draft) throw new DeskError(400, 'No draft');
-    this.db.prepare('UPDATE tickets SET approved_version = version WHERE id = ?').run(id);
+    this.db.prepare('UPDATE tickets SET approved_version = version WHERE id = ? AND tenant_id = ?')
+      .run(id, actor.tenantId);
     record(this.db, id, 'approved', actor.id);
     return this.getTicket(actor, id);
   }
   handoff(actor, id) {
     this.row(actor, id);
-    this.db.prepare("UPDATE tickets SET owner = 'human' WHERE id = ?").run(id);
+    this.db.prepare("UPDATE tickets SET owner = 'human' WHERE id = ? AND tenant_id = ?")
+      .run(id, actor.tenantId);
     record(this.db, id, 'human_handoff', actor.id);
     return this.getTicket(actor, id);
   }
@@ -59,7 +66,8 @@ export class DeskService {
         if (attempt === 1) throw error;
       }
     }
-    this.db.prepare("UPDATE tickets SET send_state = 'SENT' WHERE id = ?").run(id);
+    this.db.prepare("UPDATE tickets SET send_state = 'SENT' WHERE id = ? AND tenant_id = ?")
+      .run(id, actor.tenantId);
     record(this.db, id, 'sent', `${automatic ? 'automation' : actor.id}: ${result.providerMessageId}`);
     return this.getTicket(actor, id);
   }
