@@ -1,90 +1,80 @@
 # Handoff
 
-> **Status: work in progress.** Requirements 1 (customer-data isolation) and 2 (duplicate webhooks) are complete and verified. Requirements 3-6 are not implemented yet. This document is updated as each requirement is finished. Spanish version: `HANDOFF_SPANISH.md`.
+> **Status: work in progress.** Requirements 1 (isolation), 2 (duplicate webhooks) and 3 (exact-text approval) are complete and verified. Requirements 4-6 are not implemented yet. Updated as each requirement is finished. Spanish version: `HANDOFF_SPANISH.md`.
 
 ## Changes and ownership
 
 **Completed**
 
-- **Requirement 1 - Isolation between organizations** (`src/service.mjs`).
-  - `row(actor, id)` now looks a ticket up by `id` **and** the actor's `tenant_id`. The organization comes from the actor resolved on the server (bearer token), never from the request body, the query string or the URL.
-  - A ticket of another organization returns **404**, identical to a ticket that does not exist, so ticket IDs cannot be enumerated. An actor without an organization gets 401.
-  - Defense in depth: the four `UPDATE` statements (`updateDraft`, `approveDraft`, `handoff` and the `SENT` update in `sendReply`) also filter by `tenant_id`.
-  - Routes, fixture identities, the mock provider and the database schema were not changed by this requirement.
+- **Requirement 1 - Isolation between organizations** (`src/service.mjs`). `row(actor, id)` looks a ticket up by `id` **and** the actor's `tenant_id`, which comes from the server-resolved bearer token, never from the request. A foreign ticket returns **404**, identical to a missing one, so IDs cannot be enumerated. The `UPDATE` statements also filter by `tenant_id` as defense in depth.
 - **Requirement 2 - Duplicate webhooks** (`src/store.mjs`, `src/service.mjs`, `src/server.mjs`).
-  - `messages` now has `tenant_id` and `UNIQUE(tenant_id, event_id)`. An event is identified by (organization, eventId), so Alpha and Beta may reuse the same `eventId`. The database constraint is the real guarantee; it also holds across restarts and several connections.
-  - `receiveWebhook` inserts the message and the `inbound` audit entry in **one transaction** (`BEGIN IMMEDIATE`). A failure in either write rolls back both, and a failed attempt does not consume the `eventId`.
-  - A replayed event answers **200 with `duplicate: true`** and creates nothing: no second message and no second audit entry. The first delivery answers `duplicate: false`. A replay with different text does not overwrite the original.
-  - Invalid input answers **400**, never 5xx: a JSON `null` body (and any non-object body, in `server.mjs`), a missing or empty `eventId`, a non-string `body`, an unknown ticket, or a ticket that belongs to another organization.
-  - **Old schema guard:** `CREATE TABLE IF NOT EXISTS` would silently keep an old `messages` table without `tenant_id`. `openStore` now refuses to start on such a database with a clear message. **If `data/` already exists from an earlier run, stop the app and delete `data/` before starting.**
-- **Tests added:** `test/isolation.test.mjs` (service level), `test/isolation-http.test.mjs` (real server on port 4390), `test/webhook.test.mjs` (service level), `test/webhook-http.test.mjs` (real server on port 4391) and `test/helpers.mjs` (starts the real server with a temporary SQLite database). Every HTTP test file uses its own port because `node --test` runs files in parallel.
+  - `messages` has `tenant_id` and `UNIQUE(tenant_id, event_id)`, so Alpha and Beta may reuse an `eventId`. The constraint holds across restarts and connections.
+  - Message and `inbound` audit entry are written in one `BEGIN IMMEDIATE` transaction. A replay answers **200 `duplicate: true`** and creates nothing.
+  - Invalid input (JSON `null`, missing `eventId`, unknown or foreign ticket) answers **400**, never 5xx.
+  - `openStore` refuses a database with the old schema. **If `data/` exists from an earlier run, stop the app and delete `data/`.**
+- **Requirement 3 - Approval of the exact text** (`src/service.mjs`, `src/server.mjs`).
+  - `updateDraft` bumps the version **and clears `approved_version`**, so edited text must be approved again. It no longer touches `send_state`, so an edit cannot hide a `SENT` or `UNKNOWN` delivery.
+  - `sendReply` decides what to send in one transaction: `send_state` must be `DRAFT` (otherwise **409**, so a sent reply cannot be sent again), the approval must match the current version (otherwise 409), and it captures that body and version. The provider receives exactly that body; an edit made while the provider call is in flight cannot change it.
+  - `approveDraft` accepts an optional `version`: if the draft moved on, it answers 409; a non-integer gives 400. Omitting it approves the current version. The audit records the version in `approved` and `sent` entries (for example `agent-alpha: v2`).
+  - Decisions: editing stays allowed after `SENT`/`UNKNOWN` (state preserved); a ticket holds one sent reply, and a follow-up flow is not designed. The pinned body/version live in memory inside `sendReply`. Writing them to `attempts` is left to requirement 4, because an attempt row needs `UNKNOWN`/`FAILED` or a failed send would leave the ticket stuck on `UNIQUE(ticket_id, version)`.
+- **Tests added:** `isolation.test.mjs`, `isolation-http.test.mjs` (port 4390), `webhook.test.mjs`, `webhook-http.test.mjs` (4391), `approval.test.mjs`, `approval-http.test.mjs` (4392) and `helpers.mjs` (starts the real server with a temporary SQLite database; one port per HTTP file because `node --test` runs files in parallel).
 
-**Proposed, not started**
-
-- Requirement 3: approval of the exact reply.
-- Requirement 4: honest delivery state (`UNKNOWN`) and `reconcile`.
-- Requirement 5: human takeover.
-- Requirement 6: usable handoff UI.
+**Proposed, not started:** requirement 4 (honest delivery, `UNKNOWN`, `reconcile`), 5 (human takeover), 6 (usable handoff UI).
 
 ## Verification
 
-Command: `npm test` (Node v24.22.2). The original code is commit `aa0662a`. Requirement 1 is commit `d5f7b3a`. Requirement 2 is the uncommitted diff against `d5f7b3a`.
+Command: `npm test` (Node v24.22.2). Original code `aa0662a`; requirement 1 `d5f7b3a`; requirement 2 `5200b04`; requirement 3 is the uncommitted diff against `5200b04`.
 
-- **After the fixes:** `npm test` -> **21 of 21 tests pass, 0 fail** (8 for requirement 1 including the 2 original smoke tests, 13 for requirement 2), run in the current project folder.
-- **Requirement 1, before the fix** (real run of the isolation tests against the original `service.mjs`): **4 of 8 failed**. Alpha received **HTTP 200** when reading Beta's ticket 202. Failing tests:
-  - `a tenantId supplied by the client never widens access`
-  - `alpha cannot act on beta ticket 202 over HTTP, and beta data stays untouched`
-  - `alpha cannot read, edit, approve, take over, send or reconcile a beta ticket`
-  - `a foreign ticket is indistinguishable from one that does not exist`
-- **Requirement 2, before the fix** (real run of `webhook.test.mjs` and `webhook-http.test.mjs` against the original `service.mjs`, `store.mjs` and `server.mjs` from `aa0662a`, in a temporary copy): **11 of 13 failed, 2 passed**. The two that passed only cover the missing webhook secret and an event naming another organization's ticket, which the original code already handled. Failing tests include:
-  - `the same event sent twice answers 200 both times but is stored once`
-  - `25 simultaneous copies of one event are stored exactly once`
-  - `a duplicate is still detected after a restart and by a second connection`
-  - `message and audit entry are written atomically`
-  - `malformed webhook bodies get 400, never 5xx`
-- Tests that passed both before and after: the 2 original smoke tests, the invalid-identity test, the own-tickets test, the missing-secret test and the cross-organization event test.
-- **Verified only manually:** nothing yet. Still to check: in the browser, switch between Alpha and Beta and confirm each sees only its own ticket; replay the same event twice with `npm run event` and confirm one message appears.
-- **Not covered yet:** requirements 3-6 (see remaining defects below). The second original smoke test still passes with the defective send logic, so it proves nothing about delivery.
+- **After the fixes:** **33 of 33 tests pass, 0 fail** (8 + 13 + 12), run in the project folder.
+- **Requirement 1, before the fix:** 4 of 8 failed; Alpha got **HTTP 200** reading Beta's ticket 202.
+- **Requirement 2, before the fix** (tests against the original `service.mjs`, `store.mjs`, `server.mjs` in a temporary copy): **11 of 13 failed**, for example `25 simultaneous copies of one event are stored exactly once` and `message and audit entry are written atomically`.
+- **Requirement 3, before the fix** (new tests against the code from `5200b04`): **9 of 12 failed, 3 passed**. The 3 that passed are regression guards. Failing tests include:
+  - `editing an approved draft invalidates the approval, so the new text cannot be sent`
+  - `a reply that was already sent cannot be sent again`
+  - `editing after SENT keeps the SENT state and still cannot trigger a second send`
+  - `editing never erases an uncertain delivery state, and that state blocks sending`
+  - `approving can name the version, and a stale version is refused`
+- **Verified only manually:** nothing yet. Still to check in the browser: Alpha and Beta see only their own ticket; a replayed event (`npm run event`) shows one message; edit-after-approve shows an error on Send.
+- **Not covered:** requirements 4-6. The `UNKNOWN` state is simulated in a test by writing it to the database, because the code does not produce it yet. A true double click is not fixed: two simultaneous sends can both read `DRAFT` before either marks `SENT` (requirement 4).
 
 ## Operator instructions
 
-Pending (depends on requirement 4). For requirements 1 and 2 only:
+Pending (depends on requirement 4). For requirements 1-3 only:
 
-- A support agent sees only their own organization's tickets. Asking for another organization's ticket returns "Ticket not found" by design; this is not an outage.
-- If the webhook provider resends an event, the second call answers `duplicate: true` and nothing changes. This is expected, not an error.
-- If the app refuses to start with an "older schema" message, stop it and delete the `data/` folder (or point `DESK_DB` to a new file). Delete `data/` only on a demo database: it removes all local data.
+- An agent sees only their organization's tickets. Another organization's ticket shows "Ticket not found" by design.
+- A repeated webhook event answers `duplicate: true` and changes nothing; this is expected.
+- After editing a draft, **approve it again**. Send is refused (409) until the current version is approved. A ticket already `SENT`, or with an unconfirmed send, refuses new sends.
+- If the app refuses to start with an "older schema" message, delete `data/` (demo data only).
 
 ## Remaining risks and production plan
 
 **Remaining defects (not yet fixed):**
 
-- Editing a draft does not invalidate its approval, and `sendReply` sends the current draft rather than the approved text.
-- `sendReply` retries automatically with a new `clientRef`, which can send the customer two messages, and it has no timeout.
-- Nothing is stored in `attempts` before calling the provider. There is no `UNKNOWN` or `FAILED` state and `reconcile` returns 501.
+- `sendReply` retries with a new `clientRef`, which can send the customer two messages, and has no timeout.
+- Nothing is stored in `attempts` before calling the provider; there is no `UNKNOWN` or `FAILED` state and `reconcile` returns 501.
 - Two simultaneous sends can both pass the checks.
 - Human takeover is not enforced on automatic sends, and `handoff` does not record who took the ticket.
-- The UI shows state and audit as raw JSON, shows only inbound messages and has no auto-refresh.
+- The UI shows raw JSON, only inbound messages, always-active buttons and no auto-refresh.
 
-**Accepted shortcuts (per `CONTRACT.md`):**
+**Accepted shortcuts (per `CONTRACT.md`), explained and not solved:**
 
-- Demo bearer tokens and a published webhook secret.
-- The webhook trusts the `tenantId` in its body because the secret authenticates the caller.
-- Single process, SQLite, synthetic data. `BEGIN IMMEDIATE` and the `UNIQUE` constraint are enough for this, but SQLite would not scale to several writers.
+- Demo bearer tokens and a published webhook secret. The webhook trusts the body's `tenantId` because the secret authenticates the caller.
+- One process, SQLite, synthetic data. `BEGIN IMMEDIATE` and `UNIQUE` suffice here but would not scale to several writers.
+- Out of scope by instruction: OAuth, a real LLM, attachments, billing and deployment. The mock provider and the demo authentication were not changed.
 
 **First checks for a real GHL pilot (proposed):**
 
-- Derive the organization from verified identity only (for example, mapping the GHL location ID to a tenant), never from client input.
-- Put `tenant_id` on every table (still missing on `audit` and `attempts`) and add database constraints.
-- Verify the real GHL webhook signature and retry behavior, and confirm that its event IDs are stable across retries.
-- Run a two-sandbox-location test where cross-access must return 404.
-- Log and alert on denied cross-organization attempts and on duplicate-event rates (not implemented today).
+- Derive the organization from verified identity only (for example, GHL location ID to tenant).
+- Put `tenant_id` on every table (missing on `audit` and `attempts`) and add database constraints.
+- Verify the real GHL webhook signature, retry behavior and event-ID stability.
+- Test with two sandbox locations: cross-access must return 404.
+- Alert on denied cross-organization attempts and on duplicate-event rates (not implemented).
 - Rollback by redeploying the previous build.
 
 This exercise is not production-ready.
 
 ## AI use and time
 
-- **Tool:** Claude (Anthropic) in claude.ai with the Desktop Commander and Filesystem extensions, used to review the project, plan the work, draft the tests, propose the fixes and run the test suite.
-- **Accepted suggestion (requirement 1):** scope `row()` to the actor's organization and return 404 for foreign tickets. Verified by the tests above, which fail on the original code and pass after the fix.
-- **Accepted suggestion (requirement 2):** enforce uniqueness with `UNIQUE(tenant_id, event_id)` plus `ON CONFLICT DO NOTHING`, inside one `BEGIN IMMEDIATE` transaction together with the audit entry. Verified by the 13 webhook tests: 11 fail on the original code and all 13 pass after the fix.
-- **Time:** about 10 minutes for requirement 1 (estimate). Requirement 2 time not recorded yet. Total time to be updated at the end.
+- **Tool:** Claude (Anthropic) in claude.ai with the Desktop Commander and Filesystem extensions, used to review the project, plan, draft tests, propose fixes and run the suite.
+- **Accepted suggestions:** (1) scope `row()` to the actor's organization; (2) `UNIQUE(tenant_id, event_id)` plus `ON CONFLICT DO NOTHING` in one transaction; (3) clear the approval on every edit, check state and approval and capture body and version in one transaction, and leave `send_state` alone on edit. Each is verified by tests that fail on the previous code and pass after.
+- **Time:** about 10 minutes for requirement 1 (estimate). Requirements 2 and 3 not recorded yet. Total to be updated at the end.

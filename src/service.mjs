@@ -59,20 +59,35 @@ export class DeskService {
       return { accepted: true, duplicate: false };
     });
   }
+  // Any edit bumps the version AND clears the approval: the stored text is no longer
+  // the text somebody approved. send_state is deliberately not touched, so an edit can
+  // never hide a reply that was already sent or whose delivery is uncertain.
   updateDraft(actor, id, body) {
     this.row(actor, id);
     if (typeof body !== 'string' || !body.trim()) throw new DeskError(400, 'A reply is required');
-    this.db.prepare("UPDATE tickets SET draft = ?, version = version + 1, send_state = 'DRAFT' WHERE id = ? AND tenant_id = ?")
-      .run(body, id, actor.tenantId);
-    record(this.db, id, 'draft_updated', actor.id);
+    this.inTransaction(() => {
+      this.db.prepare('UPDATE tickets SET draft = ?, version = version + 1, approved_version = NULL WHERE id = ? AND tenant_id = ?')
+        .run(body, id, actor.tenantId);
+      record(this.db, id, 'draft_updated', actor.id);
+    });
     return this.getTicket(actor, id);
   }
-  approveDraft(actor, id) {
-    const t = this.row(actor, id);
-    if (!t.draft) throw new DeskError(400, 'No draft');
-    this.db.prepare('UPDATE tickets SET approved_version = version WHERE id = ? AND tenant_id = ?')
-      .run(id, actor.tenantId);
-    record(this.db, id, 'approved', actor.id);
+  // `version` is optional. When the caller names the version it is looking at and the
+  // draft has moved on since, the approval is refused (409) instead of silently
+  // approving text the approver never saw.
+  approveDraft(actor, id, version) {
+    this.row(actor, id);
+    if (version != null && !Number.isSafeInteger(version)) throw new DeskError(400, 'version must be an integer');
+    this.inTransaction(() => {
+      const t = this.row(actor, id);
+      if (!t.draft) throw new DeskError(400, 'No draft');
+      if (version != null && version !== t.version) {
+        throw new DeskError(409, `The draft changed: its current version is ${t.version}`);
+      }
+      this.db.prepare('UPDATE tickets SET approved_version = version WHERE id = ? AND tenant_id = ?')
+        .run(id, actor.tenantId);
+      record(this.db, id, 'approved', `${actor.id}: v${t.version}`);
+    });
     return this.getTicket(actor, id);
   }
   handoff(actor, id) {
@@ -83,12 +98,26 @@ export class DeskService {
     return this.getTicket(actor, id);
   }
   async sendReply(actor, id, { automatic = false } = {}) {
-    const t = this.row(actor, id);
-    if (t.approved_version == null) throw new DeskError(409, 'Approve the reply first');
+    // What gets sent is decided here, in one transaction: the state check, the approval
+    // check and the read of the text happen together. The body and version captured are
+    // the approved ones; a later edit cannot change what this call sends.
+    const { body, version } = this.inTransaction(() => {
+      const t = this.row(actor, id);
+      if (t.send_state !== 'DRAFT') {
+        throw new DeskError(409, t.send_state === 'SENT'
+          ? 'A reply was already sent for this ticket'
+          : 'A previous send is not confirmed yet');
+      }
+      if (t.approved_version == null || t.approved_version !== t.version) {
+        throw new DeskError(409, 'Approve the reply first');
+      }
+      return { body: t.draft, version: t.version };
+    });
     let result;
+    // Requirement 4 will replace this retry loop; it is untouched by requirement 3.
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        result = await this.provider.send({ clientRef: randomUUID(), ticketId: id, body: t.draft });
+        result = await this.provider.send({ clientRef: randomUUID(), ticketId: id, body });
         break;
       } catch (error) {
         if (attempt === 1) throw error;
@@ -96,7 +125,7 @@ export class DeskService {
     }
     this.db.prepare("UPDATE tickets SET send_state = 'SENT' WHERE id = ? AND tenant_id = ?")
       .run(id, actor.tenantId);
-    record(this.db, id, 'sent', `${automatic ? 'automation' : actor.id}: ${result.providerMessageId}`);
+    record(this.db, id, 'sent', `${automatic ? 'automation' : actor.id}: ${result.providerMessageId} (v${version})`);
     return this.getTicket(actor, id);
   }
   async reconcile(actor, id) {

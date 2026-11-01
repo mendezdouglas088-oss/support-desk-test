@@ -43,7 +43,7 @@ const server = createServer(async (req, res) => {
     let result;
     switch (action) {
       case 'draft': result = service.updateDraft(actor, id, b.body); break;
-      case 'approve': result = service.approveDraft(actor, id); break;
+      case 'approve': result = service.approveDraft(actor, id, b.version); break;
       case 'handoff': result = service.handoff(actor, id); break;
       case 'send': result = await service.sendReply(actor, id); break;
       case 'automation': result = await service.sendReply(actor, id, { automatic: true }); break;
