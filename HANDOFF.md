@@ -4,15 +4,15 @@ Requirements 1-6 are implemented and `npm test` passes 78 of 78. The UI has no b
 
 ## Changes and ownership
 
-**Completed** (one commit per requirement; 6 and 7 together in `a34b86a`)
+**Completed** (one commit per requirement; 6 and 7 together in `e5374e0`)
 
 1. **Isolation** (`d5f7b3a`). `row(actor, id)` looks a ticket up by id **and** the tenant of the server-resolved token; `UPDATE`s filter by tenant too. A foreign ticket gives 404, identical to a missing one.
 2. **Duplicate webhooks** (`5200b04`). `UNIQUE(tenant_id, event_id)`; message and audit are written in one `BEGIN IMMEDIATE` transaction. A replay answers 200 `duplicate: true` and creates nothing; malformed bodies give 400. A `data/` folder from an older schema is refused: delete it.
 3. **Exact approval** (`2b2ed93`). Every edit bumps the version and clears the approval, without touching `send_state`. `sendReply` checks state and approval and pins body and version in one transaction. `approve` takes an optional `version` (409 if stale).
 4. **Honest delivery** (`6e94356`). The attempt is stored as `PENDING` with its `client_ref` **before** the single provider call (3 s timeout, no retry). 200 is `SENT`; 503 is `FAILED` (safe to resend); anything else is `UNKNOWN` (504) and blocks every new send. A `PENDING` found at startup becomes `UNKNOWN`, so a kill (no SIGTERM on Windows) cannot cause a second send. `reconcile` looks up the stored reference: delivered is `SENT` (plus a `duplicate_delivery` audit if count > 1); `not_found` or a failed lookup stays `UNKNOWN`; nothing to check is 409.
 5. **Takeover** (`1c22e36`). `owner` is checked in the transaction that reserves the attempt, so `/automation` after takeover answers 409 and audits `automation_blocked`. Manual human sends still work. `human_id` records who took the ticket; another agent gets 409.
-6. **Usable UI** (`a34b86a`, `public/index.html`). A status banner names the next safe action; buttons are enabled by state (the server still decides); the conversation shows customer messages and our replies with state and date; attempts and audit are readable tables with highlighted unresolved failures; the page refreshes every 4 s without overwriting a draft; server text is only inserted as text nodes.
-7. **Tests** (the last ones in `a34b86a`): 78 across `isolation`, `webhook`, `approval`, `delivery`, `takeover` (service-level and `-http` files), `ui.test.mjs` and the original smoke tests. HTTP files use ports 4390-4401, one per file.
+6. **Usable UI** (`e5374e0`, `public/index.html`). A status banner names the next safe action; buttons are enabled by state (the server still decides); the conversation shows customer messages and our replies with state and date; attempts and audit are readable tables with highlighted unresolved failures; the page refreshes every 4 s without overwriting a draft; server text is only inserted as text nodes.
+7. **Tests** (the last ones in `e5374e0`): 78 across `isolation`, `webhook`, `approval`, `delivery`, `takeover` (service-level and `-http` files), `ui.test.mjs` and the original smoke tests. HTTP files use ports 4390-4401, one per file.
 
 **Proposed, not done:** release a ticket back to automation; an escalation path for an `UNKNOWN` that never resolves; a follow-up reply after `SENT`.
 
