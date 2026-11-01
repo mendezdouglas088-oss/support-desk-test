@@ -9,6 +9,15 @@ export class DeskError extends Error {
 export function openStore(path) {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
+  // CREATE TABLE IF NOT EXISTS never alters a table that already exists, so a
+  // database file made by an older version of this schema would silently keep
+  // the old messages table (no tenant_id, no unique event). Fail loudly instead.
+  const messageColumns = db.prepare('PRAGMA table_info(messages)').all().map((c) => c.name);
+  if (messageColumns.length > 0 && !messageColumns.includes('tenant_id')) {
+    db.close();
+    throw new Error(`Database "${path}" was created with an older schema (messages.tenant_id is missing). `
+      + 'Stop the app, delete the data/ folder (or point DESK_DB to a new file) and start again.');
+  }
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA busy_timeout = 3000;
@@ -19,8 +28,10 @@ export function openStore(path) {
       approved_version INTEGER, send_state TEXT NOT NULL DEFAULT 'DRAFT'
     );
     CREATE TABLE IF NOT EXISTS messages (
-      id INTEGER PRIMARY KEY, ticket_id INTEGER NOT NULL, event_id TEXT NOT NULL,
-      body TEXT NOT NULL
+      id INTEGER PRIMARY KEY, tenant_id TEXT NOT NULL, ticket_id INTEGER NOT NULL,
+      event_id TEXT NOT NULL, body TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(tenant_id, event_id)
     );
     CREATE TABLE IF NOT EXISTS audit (
       id INTEGER PRIMARY KEY, ticket_id INTEGER NOT NULL, action TEXT NOT NULL,

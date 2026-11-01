@@ -1,45 +1,15 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { once } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { startServer } from './helpers.mjs';
 
-const PORT = 4390;
-const BASE = `http://127.0.0.1:${PORT}`;
 const ALPHA = 'demo-alpha-token';
 const BETA = 'demo-beta-token';
-const serverFile = fileURLToPath(new URL('../src/server.mjs', import.meta.url));
-let child;
-let dir;
+let server;
 
-before(async () => {
-  dir = mkdtempSync(join(tmpdir(), 'desk-http-'));
-  child = spawn(process.execPath, [serverFile], {
-    env: { ...process.env, PORT: String(PORT), DESK_DB: join(dir, 'desk.sqlite') },
-    stdio: ['ignore', 'pipe', 'inherit']
-  });
-  await new Promise((resolve, reject) => {
-    child.once('error', reject);
-    child.once('exit', (code) => reject(new Error(`server exited early (${code})`)));
-    child.stdout.on('data', (d) => { if (String(d).includes('Support desk')) resolve(); });
-  });
-  child.removeAllListeners('exit');
-});
+before(async () => { server = await startServer(4390); });
+after(async () => { await server?.stop(); });
 
-after(async () => {
-  if (child && child.exitCode === null) { child.kill(); await once(child, 'exit'); }
-  if (dir) rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
-});
-
-async function call(token, method, path, body) {
-  const headers = { 'Content-Type': 'application/json' };
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const res = await fetch(BASE + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
-  return { status: res.status, json: await res.json().catch(() => null) };
-}
+const call = (...args) => server.call(...args);
 const denied = (status) => [403, 404].includes(status);
 
 test('requests without a valid identity are rejected', async () => {

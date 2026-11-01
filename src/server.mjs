@@ -13,7 +13,11 @@ const read = async req => {
   for await (const chunk of req) {
     body += chunk; if (body.length > 100000) throw new DeskError(413, 'Body too large');
   }
-  try { return body ? JSON.parse(body) : {}; } catch { throw new DeskError(400, 'Invalid JSON'); }
+  let parsed;
+  try { parsed = body ? JSON.parse(body) : {}; } catch { throw new DeskError(400, 'Invalid JSON'); }
+  // JSON.parse('null'), '42' or '[]' are valid JSON but not a request object.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new DeskError(400, 'Body must be a JSON object');
+  return parsed;
 };
 const json = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
 const server = createServer(async (req, res) => {

@@ -22,14 +22,42 @@ export class DeskService {
     return row;
   }
   getTicket(actor, id) { return ticketView(this.db, this.row(actor, id)); }
+  // Runs fn inside one write transaction. BEGIN IMMEDIATE takes the write lock up
+  // front, so two connections (or a restarted process) can never interleave their
+  // check-then-write. Commits on success and rolls everything back on any error.
+  inTransaction(fn) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch { /* the transaction already ended */ }
+      throw error;
+    }
+  }
+  // Inbound webhook. An event is identified by (organization, eventId): replaying it
+  // answers 200 with duplicate:true and changes nothing. The UNIQUE constraint in the
+  // database is the real guarantee; it also holds across restarts and processes.
   receiveWebhook(event) {
-    const t = this.db.prepare('SELECT * FROM tickets WHERE id = ? AND tenant_id = ?')
-      .get(event.ticketId, event.tenantId);
-    if (!t || !event.eventId || typeof event.body !== 'string') throw new DeskError(400, 'Invalid event');
-    this.db.prepare('INSERT INTO messages(ticket_id, event_id, body) VALUES (?, ?, ?)')
-      .run(t.id, event.eventId, event.body);
-    record(this.db, t.id, 'inbound', event.eventId);
-    return { accepted: true };
+    const invalid = () => new DeskError(400, 'Invalid event');
+    if (event === null || typeof event !== 'object' || Array.isArray(event)) throw invalid();
+    const { tenantId, ticketId, eventId, body } = event;
+    const id = typeof ticketId === 'number' ? ticketId
+      : typeof ticketId === 'string' && /^\d+$/.test(ticketId) ? Number(ticketId) : NaN;
+    const eid = typeof eventId === 'number' && Number.isFinite(eventId) ? String(eventId) : eventId;
+    if (typeof tenantId !== 'string' || !tenantId || !Number.isSafeInteger(id)
+      || typeof eid !== 'string' || !eid.trim() || typeof body !== 'string') throw invalid();
+    return this.inTransaction(() => {
+      const t = this.db.prepare('SELECT id FROM tickets WHERE id = ? AND tenant_id = ?').get(id, tenantId);
+      if (!t) throw invalid();
+      const inserted = this.db.prepare(
+        'INSERT INTO messages(tenant_id, ticket_id, event_id, body) VALUES (?, ?, ?, ?) '
+        + 'ON CONFLICT(tenant_id, event_id) DO NOTHING').run(tenantId, t.id, eid, body);
+      if (inserted.changes === 0) return { accepted: true, duplicate: true };
+      record(this.db, t.id, 'inbound', eid);
+      return { accepted: true, duplicate: false };
+    });
   }
   updateDraft(actor, id, body) {
     this.row(actor, id);
